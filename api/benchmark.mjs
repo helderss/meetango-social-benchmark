@@ -135,6 +135,57 @@ export function summarizeContentResults(rows) {
   };
 }
 
+
+export function summarizeThroughputBatch(rows, batchElapsedMs, mode = "parallel") {
+  const base = summarizeContentResults(rows);
+  const attempts = rows.length;
+  return {
+    ...base,
+    mode,
+    batch_elapsed_ms: batchElapsedMs,
+    effective_ms_per_profile: attempts ? Math.round(batchElapsedMs / attempts) : null,
+    throughput_profiles_per_sec: batchElapsedMs > 0 ? Number((attempts / (batchElapsedMs / 1000)).toFixed(3)) : null,
+  };
+}
+
+export function summarizeApifyBatchRecords(provider, usernames, rawRecords) {
+  const records = Array.isArray(rawRecords) ? rawRecords : [];
+  const byUsername = new Map();
+  for (const record of records) {
+    const username = pick(record, ["username", "user_name", "account"]);
+    if (username) byUsername.set(String(username).replace(/^@/, "").toLowerCase(), record);
+  }
+
+  return usernames.map((username) => {
+    const record = byUsername.get(String(username).toLowerCase()) || null;
+    if (!record) {
+      return {
+        provider,
+        username,
+        success: false,
+        posts_returned: 0,
+        captions_nonempty: 0,
+        captions_nonempty_ratio: 0,
+        caption_chars_total: 0,
+        avg_caption_chars: 0,
+        captions: [],
+        dates: [],
+        content_raw_bytes: 0,
+        error: "profile_not_returned",
+      };
+    }
+    const content = extractContentMetrics([record], provider);
+    return {
+      provider,
+      username,
+      success: true,
+      profile_posts_count: pick(record, ["postsCount", "posts_count", "media_count"]),
+      avatar_url: pick(record, ["profilePicUrlHD", "profilePicUrl", "profile_pic_url_hd", "profile_pic_url", "profile_image_link"]),
+      ...content,
+    };
+  });
+}
+
 function normalize(provider, username, raw, latencyMs, extra = {}) {
   let p = raw;
   if (provider === "scrapecreators") p = raw?.data?.user ?? raw?.data ?? raw;
@@ -494,9 +545,11 @@ export function summarizeBrightDataAsyncBatch(usernames, rawRecords, batchElapse
     successes,
     failures: usernames.length - successes,
     records_returned: records.length,
+    mode: "async_batch_10",
     batch_elapsed_ms: batchElapsedMs,
     trigger_latency_ms: triggerLatencyMs,
     effective_ms_per_profile: usernames.length ? Math.round(batchElapsedMs / usernames.length) : null,
+    throughput_profiles_per_sec: batchElapsedMs > 0 ? Number((usernames.length / (batchElapsedMs / 1000)).toFixed(3)) : null,
     avg_posts_returned: usernames.length ? Number((results.reduce((a,r)=>a+(r.posts_returned||0),0)/usernames.length).toFixed(2)) : 0,
     avg_captions_nonempty: usernames.length ? Number((results.reduce((a,r)=>a+(r.captions_nonempty||0),0)/usernames.length).toFixed(2)) : 0,
     avg_caption_chars_total: usernames.length ? Math.round(results.reduce((a,r)=>a+(r.caption_chars_total||0),0)/usernames.length) : 0,
@@ -600,6 +653,80 @@ async function runProviderContent(provider, username) {
   if (provider === "brightdata") return runBrightDataContent(username);
   if (provider === "apify_official" || provider === "apify_community") return runApifyContent(provider, username);
   throw new Error("Unknown content provider");
+}
+
+
+async function runApifyContentBatch(provider, usernames) {
+  const started = Date.now();
+  const isOfficial = provider === "apify_official";
+  const actor = isOfficial ? "apify/instagram-profile-scraper" : "dami_studio/instagram-profile-scraper";
+  const input = isOfficial
+    ? { usernames, includeAboutSection: false }
+    : { usernames, includeLatestPosts: true, maxItems: usernames.length, concurrency: Math.min(10, usernames.length) };
+
+  const token = process.env.APIFY_API_TOKEN;
+  const encodedActor = actor.replace("/", "~");
+  const url = `https://api.apify.com/v2/acts/${encodedActor}/run-sync-get-dataset-items?token=${encodeURIComponent(token)}&timeout=120`;
+  const response = await fetchJson(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  }, 125000);
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${JSON.stringify(response.body).slice(0,500)}`);
+
+  let rows = summarizeApifyBatchRecords(provider, usernames, response.body);
+  const avatarChecks = await Promise.all(rows.map((row) => avatarCheck(row.avatar_url)));
+  const batchElapsed = Date.now() - started;
+  rows = rows.map((row, i) => ({
+    ...row,
+    total_latency_ms: batchElapsed,
+    actor_run_latency_ms: response.latencyMs,
+    avatar_latency_ms: avatarChecks[i]?.avatar_latency_ms ?? null,
+    avatar_downloadable: avatarChecks[i]?.avatar_downloadable ?? false,
+    actor_runs_estimate: 1,
+  }));
+
+  return {
+    provider,
+    mode: "single_actor_run_10",
+    summary: summarizeThroughputBatch(rows, batchElapsed, "single_actor_run_10"),
+    results: rows,
+  };
+}
+
+async function runThroughputProvider(provider) {
+  const usernames = RETEST_SELECTED.map((row) => row.username);
+  if (provider === "apify_official" || provider === "apify_community") {
+    return runApifyContentBatch(provider, usernames);
+  }
+  if (provider !== "scrapecreators" && provider !== "hiker") {
+    throw new Error("Unsupported throughput provider");
+  }
+
+  const started = Date.now();
+  const rows = await mapLimit(RETEST_SELECTED, RETEST_SELECTED.length, async (row) => {
+    try {
+      return await runProviderContent(provider, row.username);
+    } catch (error) {
+      return {
+        provider,
+        username: row.username,
+        success: false,
+        total_latency_ms: Date.now() - started,
+        error: String(error?.message || error),
+        posts_returned: 0,
+        captions_nonempty: 0,
+        caption_chars_total: 0,
+      };
+    }
+  });
+  const batchElapsed = Date.now() - started;
+  return {
+    provider,
+    mode: "parallel_10",
+    summary: summarizeThroughputBatch(rows, batchElapsed, "parallel_10"),
+    results: rows,
+  };
 }
 
 async function scoutWithHiker(target = 10, scanLimit = 100) {
@@ -748,6 +875,33 @@ $('download').onclick=()=>{if(!finalPayload)return;const blob=new Blob([JSON.str
 </script></body></html>`, {headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}});
 }
 
+
+function throughputPage() {
+  return new Response(`<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Meetango Benchmark — Throughput</title>
+<style>body{font-family:system-ui,sans-serif;max-width:1100px;margin:32px auto;padding:0 18px;color:#171717}input,button{font:inherit}input{padding:10px;width:min(520px,100%);box-sizing:border-box}button{padding:10px 14px;margin:5px 4px 5px 0;cursor:pointer}.card{border:1px solid #ddd;border-radius:10px;padding:16px;margin:16px 0}.muted{color:#666}.big{font-size:28px;font-weight:700;margin-top:8px}pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px;max-height:380px;overflow:auto}table{border-collapse:collapse;width:100%;font-size:14px}th,td{border-bottom:1px solid #ddd;text-align:left;padding:8px}</style></head>
+<body><h1>Meetango Social Benchmark</h1><h2>Throughput — mesmos 10 perfis</h2>
+<div class="card"><b>BENCHMARK_RUN_KEY</b><br><input id="key" type="password" autocomplete="off" placeholder="Cole a chave"><p class="muted">Execute um fornecedor por vez. Os resultados ficam acumulados nesta página.</p></div>
+<div class="card"><h3>Perfis</h3><div id="selected"></div></div>
+<div class="card"><h3>Executar</h3><div id="buttons"></div><div id="state" class="muted">Aguardando.</div><div id="clock" class="big"></div></div>
+<div class="card"><h3>Comparação</h3><div id="summary">Nenhum fornecedor concluído.</div><button id="download" disabled>Baixar JSON consolidado</button></div>
+<div class="card"><h3>Último resultado</h3><pre id="raw">Aguardando...</pre></div>
+<script>
+const providers=['scrapecreators','hiker','brightdata','apify_official','apify_community'];
+const selected=${JSON.stringify(RETEST_SELECTED)}; const allResults={}; const $=id=>document.getElementById(id); let timer=null;
+function key(){return $('key').value.trim()}
+function fmt(ms){return ms==null?'-':(ms/1000).toFixed(2).replace('.',',')+' s'}
+async function post(payload){const r=await fetch('/api/benchmark',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...payload,key:key()})});const t=await r.text();let b;try{b=JSON.parse(t)}catch{b={raw:t}};if(!r.ok)throw new Error(JSON.stringify(b));return b}
+$('selected').innerHTML='<table><tr><th>#</th><th>Perfil</th><th>Grupo</th></tr>'+selected.map((x,i)=>'<tr><td>'+(i+1)+'</td><td>@'+x.username+'</td><td>'+x.group+'</td></tr>').join('')+'</table>';
+function render(){const entries=Object.entries(allResults);if(!entries.length){$('summary').textContent='Nenhum fornecedor concluído.';return}let h='<table><tr><th>Fornecedor</th><th>Modo</th><th>Sucesso</th><th>Lote</th><th>Efetivo/perfil</th><th>Perfis/s</th><th>Mediana individual</th><th>Posts médios</th><th>Legendas médias</th><th>Chars médios</th></tr>';for(const [p,x] of entries){const s=x.summary||x;h+='<tr><td>'+p+'</td><td>'+(s.mode||'-')+'</td><td>'+s.successes+'/'+s.attempts+'</td><td>'+fmt(s.batch_elapsed_ms)+'</td><td>'+fmt(s.effective_ms_per_profile)+'</td><td>'+(s.throughput_profiles_per_sec??'-')+'</td><td>'+fmt(s.median_latency_ms)+'</td><td>'+s.avg_posts_returned+'</td><td>'+s.avg_captions_nonempty+'</td><td>'+s.avg_caption_chars_total+'</td></tr>'}h+='</table>';$('summary').innerHTML=h;$('download').disabled=entries.length!==providers.length}
+async function runBright(){const start=await post({action:'brightdata_async_start'});const snapshotId=start.snapshot_id;const startedAt=start.started_at_ms;let polls=0;$('state').textContent='brightdata: snapshot '+snapshotId+' criado; aguardando...';while(true){await new Promise(r=>setTimeout(r,5000));polls++;const status=await post({action:'brightdata_async_status',snapshot_id:snapshotId,batch_started_at_ms:startedAt,trigger_latency_ms:start.trigger_latency_ms});$('state').textContent='brightdata: '+status.status+' — consulta '+polls;if(status.status==='failed')throw new Error(JSON.stringify(status));if(status.status==='ready'){return{provider:'brightdata',summary:status.summary,results:status.summary.results,snapshot_id:snapshotId,polls}}}}
+async function runProvider(p){if(!key())return alert('Informe a BENCHMARK_RUN_KEY.');document.querySelectorAll('[data-p]').forEach(b=>b.disabled=true);const started=Date.now();timer=setInterval(()=>{$('clock').textContent=fmt(Date.now()-started)},250);$('state').textContent=p+': executando...';$('raw').textContent='';try{const out=p==='brightdata'?await runBright():await post({action:'throughput_provider',provider:p});allResults[p]=out;$('raw').textContent=JSON.stringify(out,null,2);$('state').textContent=p+': concluído';render()}catch(e){$('state').textContent=p+': erro';$('raw').textContent=String(e?.message||e)}finally{if(timer)clearInterval(timer);$('clock').textContent='';document.querySelectorAll('[data-p]').forEach(b=>b.disabled=false)}}
+$('buttons').innerHTML=providers.map(p=>'<button data-p="'+p+'">'+p+'</button>').join('');document.querySelectorAll('[data-p]').forEach(b=>b.onclick=()=>runProvider(b.dataset.p));
+$('download').onclick=()=>{const payload={generated_at:new Date().toISOString(),test:'throughput_10_profiles_all_providers',selected,providers:allResults};const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='meetango-throughput-benchmark.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
+</script></body></html>`, {headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}});
+}
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -778,6 +932,20 @@ export default {
           return json({ ok: true, elapsed_ms: Date.now() - started, result });
         } catch (error) {
           return json({ ok: false, elapsed_ms: Date.now() - started, result: { provider, username, success: false, total_latency_ms: Date.now() - started, error: String(error?.message || error) } });
+        }
+      }
+
+
+      if (action === "throughput_provider") {
+        const provider = String(body?.provider || "");
+        const allowed = ["scrapecreators", "hiker", "apify_official", "apify_community"];
+        if (!allowed.includes(provider)) return json({ error: "unknown_throughput_provider", allowed }, 400);
+        const started = Date.now();
+        try {
+          const result = await runThroughputProvider(provider);
+          return json({ ok: true, server_elapsed_ms: Date.now() - started, ...result });
+        } catch (error) {
+          return json({ error: "throughput_provider_failed", provider, elapsed_ms: Date.now() - started, detail: String(error?.message || error) }, 502);
         }
       }
 
@@ -817,7 +985,7 @@ export default {
         return json({ ok: true, status: "ready", summary });
       }
 
-      return json({ error: "unknown_action", allowed: ["scout","content_one","brightdata_async_start","brightdata_async_status"] }, 400);
+      return json({ error: "unknown_action", allowed: ["scout","content_one","throughput_provider","brightdata_async_start","brightdata_async_status"] }, 400);
     }
 
     const provider = url.searchParams.get("provider") || "env";
@@ -825,6 +993,7 @@ export default {
     if (provider === "stage2") return stage2Page();
     if (provider === "retest") return retestPage();
     if (provider === "brightdata-async") return brightDataAsyncPage();
+    if (provider === "throughput") return throughputPage();
 
     if (provider === "health") {
       return json({
