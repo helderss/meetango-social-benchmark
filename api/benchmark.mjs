@@ -77,6 +77,8 @@ function unwrapPosts(raw) {
   if (!raw) return [];
 
   if (Array.isArray(raw)) {
+    // Hiker /v1/user/medias/chunk returns [Media[], end_cursor].
+    if (Array.isArray(raw[0])) return raw[0];
     if (raw.length === 1 && Array.isArray(raw[0]?.latestPosts)) return raw[0].latestPosts;
     if (raw.length === 1 && Array.isArray(raw[0]?.posts)) return raw[0].posts;
     return raw;
@@ -431,27 +433,29 @@ async function runHikerContent(username) {
   };
 }
 
-async function runBrightDataContent(username) {
-  const started = Date.now();
-  const key = process.env.BRIGHTDATA_API_KEY;
+export function buildBrightDataProfileDiscovery(username) {
   const url = new URL("https://api.brightdata.com/datasets/v3/scrape");
   url.searchParams.set("dataset_id", "gd_l1vikfch901nx3by4");
   url.searchParams.set("type", "discover_new");
-  url.searchParams.set("discover_by", "url");
+  url.searchParams.set("discover_by", "user_name");
+  url.searchParams.set("notify", "false");
+  url.searchParams.set("include_errors", "true");
   url.searchParams.set("format", "json");
+  return { url, body: { input: [{ user_name: username }] } };
+}
 
-  const first = await fetchJson(url, {
+async function runBrightDataContent(username) {
+  const started = Date.now();
+  const key = process.env.BRIGHTDATA_API_KEY;
+  const request = buildBrightDataProfileDiscovery(username);
+
+  const first = await fetchJson(request.url, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${key}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      input: [{
-        url: `https://www.instagram.com/${username}/`,
-        num_of_posts: 12,
-      }],
-    }),
+    body: JSON.stringify(request.body),
   }, 65000);
 
   if (!first.ok) throw new Error(`Bright Data HTTP ${first.status}: ${JSON.stringify(first.body).slice(0,500)}`);
@@ -472,19 +476,20 @@ async function runBrightDataContent(username) {
     throw new Error(`Unexpected Bright Data response: ${JSON.stringify(first.body).slice(0,500)}`);
   }
 
+  const profile = normalize("brightdata", username, body, contentLatency);
   const content = extractContentMetrics(body, "brightdata");
-  const avatar = extractAvatarFromRaw(body);
-  const avatarResult = await avatarCheck(avatar);
+  const avatarResult = await avatarCheck(profile.avatar_url);
 
   return {
     provider: "brightdata",
     username,
     success: content.posts_returned > 0,
     total_latency_ms: Date.now() - started,
-    profile_latency_ms: null,
+    profile_latency_ms: contentLatency,
     content_latency_ms: contentLatency,
     avatar_latency_ms: avatarResult.avatar_latency_ms ?? null,
     avatar_downloadable: avatarResult.avatar_downloadable ?? false,
+    profile_posts_count: profile.posts_count,
     snapshot_id: snapshotId,
     used_snapshot_fallback: usedSnapshotFallback,
     records_charged_estimate: Array.isArray(body) ? body.length : 1,
@@ -624,6 +629,45 @@ $('download').onclick=()=>{const payload={generated_at:new Date().toISOString(),
 </script></body></html>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
 }
 
+
+const RETEST_SELECTED = [
+  { username: "keniamaravasconcelos", group: "follower_only" },
+  { username: "athaisfonsecaoficial", group: "following_only" },
+  { username: "cassiogontijo", group: "follower_only" },
+  { username: "quirogamarioluis", group: "follower_only" },
+  { username: "jeanetvivian", group: "follower_only" },
+  { username: "izadoramineira", group: "following_only" },
+  { username: "laryssa.santos.9461", group: "follower_only" },
+  { username: "cdreher10", group: "follower_only" },
+  { username: "oxeindia.0", group: "following_only" },
+  { username: "pierre_pnn", group: "mutual" },
+];
+
+function retestPage() {
+  return new Response(`<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Meetango Reteste — Hiker + Bright Data</title>
+<style>body{font-family:system-ui,sans-serif;max-width:1000px;margin:32px auto;padding:0 18px;color:#171717}input,button{font:inherit}input{padding:10px;width:min(520px,100%);box-sizing:border-box}button{padding:10px 14px;margin:5px 4px 5px 0;cursor:pointer}.card{border:1px solid #ddd;border-radius:10px;padding:16px;margin:16px 0}.muted{color:#666}pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px;max-height:360px;overflow:auto}table{border-collapse:collapse;width:100%;font-size:14px}th,td{border-bottom:1px solid #ddd;text-align:left;padding:8px}progress{width:100%;height:20px}</style></head>
+<body><h1>Meetango Social Benchmark</h1><h2>Reteste corretivo — Hiker + Bright Data</h2>
+<div class="card"><b>BENCHMARK_RUN_KEY</b><br><input id="key" type="password" autocomplete="off" placeholder="Cole a chave"></div>
+<div class="card"><h3>Mesmos 10 perfis</h3><div id="selected"></div></div>
+<div class="card"><h3>Executar</h3><div id="buttons"></div><progress id="progress" max="10" value="0"></progress><div id="progressText" class="muted"></div></div>
+<div class="card"><h3>Resumo</h3><div id="summary">Nenhum teste concluído.</div><button id="download" disabled>Baixar JSON do reteste</button></div>
+<div class="card"><h3>Último resultado</h3><pre id="raw">Aguardando...</pre></div>
+<script>
+const providers=['hiker','brightdata'];
+const selected=${JSON.stringify(RETEST_SELECTED)}; const allResults={}; const $=id=>document.getElementById(id); function key(){return $('key').value.trim()}
+async function post(payload){const r=await fetch('/api/benchmark',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...payload,key:key()})});const t=await r.text();let b;try{b=JSON.parse(t)}catch{b={raw:t}};if(!r.ok)throw new Error(JSON.stringify(b));return b}
+function pct(vals,p){const a=vals.filter(Number.isFinite).sort((x,y)=>x-y);if(!a.length)return null;return a[Math.max(0,Math.min(a.length-1,Math.ceil(p*a.length)-1))]}
+function summarize(rows){const l=rows.map(x=>Number(x.total_latency_ms)).filter(Number.isFinite);const s=rows.filter(x=>x.success).length;const sum=f=>rows.reduce((a,x)=>a+(Number(x[f])||0),0);return{attempts:rows.length,successes:s,failures:rows.length-s,min_latency_ms:l.length?Math.min(...l):null,median_latency_ms:pct(l,.5),p90_latency_ms:pct(l,.9),max_latency_ms:l.length?Math.max(...l):null,avg_latency_ms:l.length?Math.round(l.reduce((a,b)=>a+b,0)/l.length):null,avg_posts_returned:rows.length?+(sum('posts_returned')/rows.length).toFixed(2):0,avg_captions_nonempty:rows.length?+(sum('captions_nonempty')/rows.length).toFixed(2):0,avg_caption_chars_total:rows.length?Math.round(sum('caption_chars_total')/rows.length):0}}
+function renderSummary(){const names=Object.keys(allResults);if(!names.length)return;let html='<table><tr><th>Fornecedor</th><th>Sucesso</th><th>Mediana</th><th>P90</th><th>Posts médios</th><th>Legendas médias</th><th>Chars médios</th></tr>';for(const n of names){const s=summarize(allResults[n]);html+='<tr><td>'+n+'</td><td>'+s.successes+'/'+s.attempts+'</td><td>'+s.median_latency_ms+' ms</td><td>'+s.p90_latency_ms+' ms</td><td>'+s.avg_posts_returned+'</td><td>'+s.avg_captions_nonempty+'</td><td>'+s.avg_caption_chars_total+'</td></tr>'}$('summary').innerHTML=html+'</table>';$('download').disabled=names.length<2}
+async function runProvider(p){if(!key())return alert('Informe a BENCHMARK_RUN_KEY.');const btn=document.querySelector('[data-p="'+p+'"]');btn.disabled=true;const rows=[];$('progress').max=selected.length;$('progress').value=0;for(let i=0;i<selected.length;i++){const u=selected[i].username;$('progressText').textContent=p+': '+(i+1)+'/'+selected.length+' — @'+u;try{const r=await post({action:'content_one',provider:p,username:u});rows.push(r.result);$('raw').textContent=JSON.stringify(r,null,2)}catch(e){rows.push({provider:p,username:u,success:false,error:e.message,total_latency_ms:null});$('raw').textContent=e.message}$('progress').value=i+1}allResults[p]=rows;renderSummary();$('progressText').textContent=p+': concluído ('+rows.filter(x=>x.success).length+'/'+rows.length+').';btn.disabled=false}
+$('selected').innerHTML='<table><tr><th>#</th><th>Perfil</th><th>Grupo</th></tr>'+selected.map((x,i)=>'<tr><td>'+(i+1)+'</td><td>@'+x.username+'</td><td>'+x.group+'</td></tr>').join('')+'</table>';
+$('buttons').innerHTML=providers.map(p=>'<button data-p="'+p+'">'+p+'</button>').join('');document.querySelectorAll('[data-p]').forEach(b=>b.onclick=()=>runProvider(b.dataset.p));
+$('download').onclick=()=>{const payload={generated_at:new Date().toISOString(),retest:true,selected,providers:Object.fromEntries(Object.entries(allResults).map(([k,v])=>[k,{summary:summarize(v),results:v}]))};const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='meetango-content-retest-hiker-brightdata.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
+</script></body></html>`, {headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}});
+}
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -663,6 +707,7 @@ export default {
     const provider = url.searchParams.get("provider") || "env";
 
     if (provider === "stage2") return stage2Page();
+    if (provider === "retest") return retestPage();
 
     if (provider === "health") {
       return json({
