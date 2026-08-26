@@ -1,6 +1,6 @@
 const RUN_KEY = process.env.BENCHMARK_RUN_KEY;
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
-const NVIDIA_MODEL = "nvidia/nemotron-mini-4b-instruct";
+export const NVIDIA_MODEL = "meta/llama-3.1-8b-instruct";
 const NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
 
 const PROFILES = [
@@ -193,6 +193,52 @@ export function buildNvidiaRequest(username, captions) {
   };
 }
 
+export function buildNvidiaPreflightRequest() {
+  return {
+    url: NVIDIA_URL,
+    body: {
+      model: NVIDIA_MODEL,
+      messages: [{ role: "user", content: "Responda apenas: OK" }],
+      temperature: 0,
+      top_p: 1,
+      max_tokens: 8,
+      stream: false,
+    },
+  };
+}
+
+async function runPreflight() {
+  if (!NVIDIA_API_KEY) return { ok: false, error: "missing_NVIDIA_API_KEY", model: NVIDIA_MODEL };
+  const request = buildNvidiaPreflightRequest();
+  const started = Date.now();
+  const response = await fetch(request.url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${NVIDIA_API_KEY}`,
+      accept: "application/json",
+    },
+    body: JSON.stringify(request.body),
+  });
+  const latencyMs = Date.now() - started;
+  const text = await response.text();
+  let payload;
+  try { payload = JSON.parse(text); }
+  catch { payload = { raw_http_text: text.slice(0, 2000) }; }
+  if (!response.ok) {
+    return { ok: false, model: NVIDIA_MODEL, latency_ms: latencyMs, http_status: response.status, error: payload };
+  }
+  const answer = payload?.choices?.[0]?.message?.content ?? "";
+  return {
+    ok: true,
+    model: NVIDIA_MODEL,
+    latency_ms: latencyMs,
+    http_status: response.status,
+    answer,
+    usage: payload?.usage ?? null,
+  };
+}
+
 export function parseModelJson(raw) {
   if (typeof raw !== "string") throw new Error("model_output_not_string");
   let text = raw.trim();
@@ -333,11 +379,11 @@ function page() {
 </style>
 </head><body>
 <h1>Meetango · menor modelo viável</h1>
-<p class="muted">Modelo inicial: <b>Nemotron Mini 4B Instruct</b> <span class="muted">(${NVIDIA_MODEL})</span> · 6 posts no máximo · zero novas chamadas de scraping.</p>
+<p class="muted">Modelo candidato: <b>Llama 3.1 8B Instruct</b> <span class="muted">(${NVIDIA_MODEL})</span> · 6 posts no máximo · zero novas chamadas de scraping.</p>
 <div class="card">
   <div class="row"><b>NVIDIA_API_KEY no servidor:</b> <span class="${NVIDIA_API_KEY ? "ok" : "bad"}">${NVIDIA_API_KEY ? "configurada" : "NÃO configurada"}</span></div>
-  <div class="row" style="margin-top:12px"><input id="key" type="password" placeholder="BENCHMARK_RUN_KEY" autocomplete="off" /><button id="run">Executar 10 perfis</button><button id="download" disabled>Baixar JSON</button></div>
-  <p id="status" class="muted">Pronto.</p>
+  <div class="row" style="margin-top:12px"><input id="key" type="password" placeholder="BENCHMARK_RUN_KEY" autocomplete="off" /><button id="verify">Verificar modelo</button><button id="run" disabled>Executar 10 perfis</button><button id="download" disabled>Baixar JSON</button></div>
+  <p id="status" class="muted">Primeiro verifique se o endpoint do modelo está ativo.</p>
 </div>
 <div class="card"><table><thead><tr><th>Perfil</th><th>Posts</th><th>Status</th><th>Latência</th><th>JSON</th></tr></thead><tbody id="rows"></tbody></table></div>
 <div class="card"><b>Último resultado</b><pre id="detail">—</pre></div>
@@ -346,11 +392,31 @@ const profiles=${JSON.stringify(safeProfiles)};
 const rows=document.getElementById('rows');
 const statusEl=document.getElementById('status');
 const detail=document.getElementById('detail');
+const verifyBtn=document.getElementById('verify');
 const runBtn=document.getElementById('run');
 const dlBtn=document.getElementById('download');
+runBtn.disabled=true;
 let results=[];
 function render(){rows.innerHTML=profiles.map((p,i)=>{const r=results[i];const st=!r?'pendente':r.ok?(r.schema_valid?'ok':'revisar'):'erro';return '<tr><td>@'+p.username+'</td><td>'+p.posts+'</td><td>'+st+'</td><td>'+(r?.latency_ms?Math.round(r.latency_ms/100)/10+'s':'—')+'</td><td>'+(r?.json_parsed===true?'sim':r?'não':'—')+'</td></tr>'}).join('')}
 render();
+verifyBtn.onclick=async()=>{
+  const run_key=document.getElementById('key').value;
+  if(!run_key){statusEl.textContent='Informe BENCHMARK_RUN_KEY.';return}
+  verifyBtn.disabled=true; runBtn.disabled=true;
+  statusEl.textContent='Verificando endpoint do '+${JSON.stringify('Llama 3.1 8B Instruct')}+'...';
+  try{
+    const res=await fetch(location.href,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({run_key,action:'preflight'})});
+    const body=await res.json(); detail.textContent=JSON.stringify(body,null,2);
+    if(body?.ok===true && body?.http_status===200){
+      statusEl.textContent='Modelo ativo: HTTP 200 em '+Math.round((body.latency_ms||0)/100)/10+'s. Benchmark liberado.';
+      runBtn.disabled=false;
+    }else{
+      statusEl.textContent='Modelo NÃO liberado. Veja o retorno abaixo.';
+      runBtn.disabled=true;
+    }
+  }catch(e){statusEl.textContent='Falha ao verificar modelo: '+String(e);runBtn.disabled=true}
+  verifyBtn.disabled=false;
+};
 runBtn.onclick=async()=>{
   const run_key=document.getElementById('key').value;
   if(!run_key){statusEl.textContent='Informe BENCHMARK_RUN_KEY.';return}
@@ -367,7 +433,7 @@ runBtn.onclick=async()=>{
 };
 dlBtn.onclick=()=>{
   const out={generated_at:new Date().toISOString(),test:'meetango_small_model_interest_profile_v1',model:'${NVIDIA_MODEL}',source:'saved_scrapecreators_onecall_v9',normalization:'up_to_6_most_recent_nonempty_captions',results};
-  const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='meetango-ai-nemotron-mini-4b-interest.json';a.click();URL.revokeObjectURL(a.href);
+  const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='meetango-ai-llama31-8b-interest.json';a.click();URL.revokeObjectURL(a.href);
 };
 </script></body></html>`;
 }
@@ -392,6 +458,7 @@ export default {
     try { body = await request.json(); }
     catch { return json({ ok: false, error: "invalid_json" }, 400); }
     if (!RUN_KEY || body?.run_key !== RUN_KEY) return json({ ok: false, error: "unauthorized" }, 401);
+    if (body?.action === "preflight") return json(await runPreflight());
     if (body?.action !== "interest_profile") return json({ ok: false, error: "unknown_action" }, 400);
     return json(await runOne(body?.username));
   },
