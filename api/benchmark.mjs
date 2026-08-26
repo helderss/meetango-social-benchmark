@@ -122,18 +122,97 @@ async function runHiker(username) {
   return normalize("hiker", username, r.body, r.latencyMs, { requests_charged_estimate: 1 });
 }
 
+export function classifyBrightDataBody(body) {
+  if (Array.isArray(body)) return { kind: "data" };
+  if (body?.snapshot_id) return { kind: "snapshot", snapshotId: body.snapshot_id };
+  return { kind: "unknown" };
+}
+
+async function fetchBrightDataSnapshot(key, snapshotId, timeoutMs = 90000) {
+  const started = Date.now();
+  const headers = { "Authorization": `Bearer ${key}` };
+
+  while (Date.now() - started < timeoutMs) {
+    const progress = await fetchJson(
+      `https://api.brightdata.com/datasets/v3/progress/${encodeURIComponent(snapshotId)}`,
+      { headers },
+      15000
+    );
+
+    if (!progress.ok) {
+      throw new Error(`Bright Data progress HTTP ${progress.status}: ${JSON.stringify(progress.body).slice(0,500)}`);
+    }
+
+    const status = progress.body?.status;
+
+    if (status === "failed") {
+      throw new Error(`Bright Data snapshot failed: ${JSON.stringify(progress.body).slice(0,500)}`);
+    }
+
+    if (status === "ready") {
+      const result = await fetchJson(
+        `https://api.brightdata.com/datasets/v3/snapshot/${encodeURIComponent(snapshotId)}?format=json`,
+        { headers },
+        20000
+      );
+
+      if (!result.ok) {
+        throw new Error(`Bright Data snapshot HTTP ${result.status}: ${JSON.stringify(result.body).slice(0,500)}`);
+      }
+
+      return {
+        body: result.body,
+        additionalLatencyMs: Date.now() - started,
+      };
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+  }
+
+  throw new Error(`Bright Data snapshot timeout after ${timeoutMs}ms: ${snapshotId}`);
+}
+
 async function runBrightData(username) {
   const key = process.env.BRIGHTDATA_API_KEY;
   const url = "https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_l1vikfch901nx3by4&format=json";
+
   const r = await fetchJson(url, {
     method: "POST",
-    headers: { "Authorization": `Bearer ${key}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      input: [{ url: `https://www.instagram.com/${username}/` }]
-    }),
+    headers: {
+      "Authorization": `Bearer ${key}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify([
+      { url: `https://www.instagram.com/${username}/` }
+    ]),
   }, 65000);
-  if (!r.ok) throw new Error(`HTTP ${r.status}: ${JSON.stringify(r.body).slice(0,500)}`);
-  return normalize("brightdata", username, r.body, r.latencyMs, { records_charged_estimate: Array.isArray(r.body) ? r.body.length : 1 });
+
+  if (!r.ok) {
+    throw new Error(`HTTP ${r.status}: ${JSON.stringify(r.body).slice(0,500)}`);
+  }
+
+  const classification = classifyBrightDataBody(r.body);
+  let body = r.body;
+  let latencyMs = r.latencyMs;
+  let snapshotId = null;
+  let usedSnapshotFallback = false;
+
+  if (classification.kind === "snapshot") {
+    snapshotId = classification.snapshotId;
+    usedSnapshotFallback = true;
+
+    const snapshot = await fetchBrightDataSnapshot(key, snapshotId);
+    body = snapshot.body;
+    latencyMs += snapshot.additionalLatencyMs;
+  } else if (classification.kind !== "data") {
+    throw new Error(`Unexpected Bright Data response: ${JSON.stringify(r.body).slice(0,500)}`);
+  }
+
+  return normalize("brightdata", username, body, latencyMs, {
+    records_charged_estimate: Array.isArray(body) ? body.length : 1,
+    snapshot_id: snapshotId,
+    used_snapshot_fallback: usedSnapshotFallback,
+  });
 }
 
 async function runApify(actor, provider, username, input) {
