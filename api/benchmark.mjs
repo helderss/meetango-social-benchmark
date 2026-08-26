@@ -68,6 +68,7 @@ function captionText(post) {
     "description",
     "caption",
     "text",
+    "edge_media_to_caption.edges.0.node.text",
   ]);
   if (typeof value === "string") return value.trim();
   return "";
@@ -89,6 +90,10 @@ function unwrapPosts(raw) {
   if (Array.isArray(raw?.latestPosts)) return raw.latestPosts;
   if (Array.isArray(raw?.data?.items)) return raw.data.items;
   if (Array.isArray(raw?.data?.posts)) return raw.data.posts;
+  const timelineEdges = raw?.data?.user?.edge_owner_to_timeline_media?.edges;
+  if (Array.isArray(timelineEdges)) return timelineEdges.map((edge) => edge?.node).filter(Boolean);
+  const directTimelineEdges = raw?.edge_owner_to_timeline_media?.edges;
+  if (Array.isArray(directTimelineEdges)) return directTimelineEdges.map((edge) => edge?.node).filter(Boolean);
   return [];
 }
 
@@ -98,7 +103,7 @@ export function extractContentMetrics(raw, provider = "generic") {
   const captions = captionsAll.filter(Boolean);
   const captionCharsTotal = captions.reduce((sum, text) => sum + text.length, 0);
   const dates = posts
-    .map((post) => pick(post, ["created_at", "taken_at", "timestamp", "datetime", "date_posted", "create_time"]))
+    .map((post) => pick(post, ["created_at", "taken_at", "taken_at_timestamp", "timestamp", "datetime", "date_posted", "create_time"]))
     .filter((value) => value !== null && value !== undefined);
 
   return {
@@ -414,41 +419,38 @@ function extractAvatarFromRaw(raw) {
 async function runScrapeCreatorsContent(username) {
   const started = Date.now();
   const key = process.env.SCRAPECREATORS_API_KEY;
-  const u = new URL("https://api.scrapecreators.com/v2/instagram/user/posts");
+  const u = new URL("https://api.scrapecreators.com/v1/instagram/profile");
   u.searchParams.set("handle", username);
   u.searchParams.set("trim", "false");
+  // Intentionally omit cache_max_age for a fair live 1-credit benchmark.
+  const response = await fetchJson(u, { headers: { "x-api-key": key } }, 65000);
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${JSON.stringify(response.body).slice(0,500)}`);
 
-  const [profileSettled, postsSettled] = await Promise.allSettled([
-    runScrapeCreators(username),
-    fetchJson(u, { headers: { "x-api-key": key } }, 65000),
-  ]);
-
-  if (postsSettled.status !== "fulfilled") throw postsSettled.reason;
-  const postsResponse = postsSettled.value;
-  if (!postsResponse.ok) throw new Error(`HTTP ${postsResponse.status}: ${JSON.stringify(postsResponse.body).slice(0,500)}`);
-
-  const profile = profileSettled.status === "fulfilled" ? profileSettled.value : null;
+  const profile = normalize("scrapecreators", username, response.body, response.latencyMs, {
+    credits_charged: response.body?.credits_charged ?? null,
+    cached: response.body?.cached ?? false,
+  });
   const avatar = profile?.avatar_url || null;
   const avatarResult = await avatarCheck(avatar);
-  const content = extractContentMetrics(postsResponse.body, "scrapecreators");
+  const content = extractContentMetrics(response.body, "scrapecreators");
 
   return {
     provider: "scrapecreators",
     username,
-    success: content.posts_returned > 0,
+    success: profile?.success === true && content.posts_returned > 0,
+    mode: "profile_one_call_live",
     total_latency_ms: Date.now() - started,
-    profile_latency_ms: profile?.latency_ms ?? null,
-    content_latency_ms: postsResponse.latencyMs,
+    profile_latency_ms: response.latencyMs,
+    content_latency_ms: response.latencyMs,
     avatar_latency_ms: avatarResult.avatar_latency_ms ?? null,
     avatar_downloadable: avatarResult.avatar_downloadable ?? false,
     profile_posts_count: profile?.posts_count ?? null,
-    credits_charged_profile: profile?.credits_charged ?? null,
-    credits_charged_content: postsResponse.body?.credits_charged ?? null,
-    cached_profile: profile?.cached ?? null,
+    credits_charged_total: response.body?.credits_charged ?? null,
+    requests_charged_estimate: 1,
+    cached_profile: response.body?.cached ?? false,
     ...content,
   };
 }
-
 async function runHikerContent(username) {
   const started = Date.now();
   const key = process.env.HIKER_API_KEY;
@@ -902,6 +904,25 @@ $('download').onclick=()=>{const payload={generated_at:new Date().toISOString(),
 </script></body></html>`, {headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}});
 }
 
+
+function scrapeCreatorsOneCallPage() {
+  const selected = RETEST_SELECTED;
+  return new Response(`<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Meetango — ScrapeCreators 1 chamada</title>
+<style>body{font-family:system-ui,sans-serif;max-width:1000px;margin:32px auto;padding:0 18px;color:#171717}input,button{font:inherit}input{padding:10px;width:min(520px,100%);box-sizing:border-box}button{padding:10px 14px;margin-top:10px;cursor:pointer}.card{border:1px solid #ddd;border-radius:10px;padding:16px;margin:16px 0}.muted{color:#666}pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px;max-height:420px;overflow:auto}table{border-collapse:collapse;width:100%;font-size:14px}th,td{border-bottom:1px solid #ddd;text-align:left;padding:8px}</style></head>
+<body><h1>ScrapeCreators — Profile 1 chamada</h1><p>Teste live sem cache: 10 perfis em paralelo usando apenas <code>/v1/instagram/profile</code>.</p>
+<div class="card"><b>BENCHMARK_RUN_KEY</b><br><input id="key" type="password" autocomplete="off" placeholder="Cole a chave"><br><button id="run">Executar 10 perfis</button> <span id="state" class="muted"></span></div>
+<div class="card"><h3>Resultado</h3><div id="summary" class="muted">Aguardando.</div><button id="download" disabled>Baixar JSON</button></div>
+<div class="card"><pre id="raw">Aguardando...</pre></div>
+<script>
+const selected=${JSON.stringify(selected)};let result=null;const $=id=>document.getElementById(id);const fmt=ms=>ms==null?'-':(ms/1000).toFixed(2).replace('.',',')+' s';
+async function post(payload){const r=await fetch('/api/benchmark',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...payload,key:$('key').value.trim()})});const t=await r.text();let b;try{b=JSON.parse(t)}catch{b={raw:t}};if(!r.ok)throw new Error(JSON.stringify(b));return b}
+$('run').onclick=async()=>{if(!$('key').value.trim())return alert('Informe a BENCHMARK_RUN_KEY.');$('run').disabled=true;$('state').textContent=' executando...';try{const out=await post({action:'throughput_provider',provider:'scrapecreators'});result=out;$('raw').textContent=JSON.stringify(out,null,2);const s=out.summary;$('summary').innerHTML='<table><tr><th>Sucesso</th><th>Lote</th><th>Efetivo/perfil</th><th>Mediana individual</th><th>Posts</th><th>Captions</th><th>Chars</th><th>Créditos</th></tr><tr><td>'+s.successes+'/'+s.attempts+'</td><td>'+fmt(s.batch_elapsed_ms)+'</td><td>'+fmt(s.effective_ms_per_profile)+'</td><td>'+fmt(s.median_latency_ms)+'</td><td>'+s.avg_posts_returned+'</td><td>'+s.avg_captions_nonempty+'</td><td>'+s.avg_caption_chars_total+'</td><td>'+out.results.reduce((a,x)=>a+(Number(x.credits_charged_total)||0),0)+'</td></tr></table>';$('download').disabled=false;$('state').textContent=' concluído';}catch(e){$('state').textContent=' erro';$('raw').textContent=String(e?.message||e)}finally{$('run').disabled=false}};
+$('download').onclick=()=>{if(!result)return;const payload={generated_at:new Date().toISOString(),test:'scrapecreators_profile_one_call_live_10',selected,result};const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='meetango-scrapecreators-onecall.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
+</script></body></html>`,{headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}});
+}
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -994,6 +1015,7 @@ export default {
     if (provider === "retest") return retestPage();
     if (provider === "brightdata-async") return brightDataAsyncPage();
     if (provider === "throughput") return throughputPage();
+    if (provider === "scrapecreators-onecall") return scrapeCreatorsOneCallPage();
 
     if (provider === "health") {
       return json({
