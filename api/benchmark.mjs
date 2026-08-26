@@ -1,6 +1,6 @@
 const RUN_KEY = process.env.BENCHMARK_RUN_KEY;
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
-const NVIDIA_MODEL = "meta/llama-3.2-3b-instruct";
+const NVIDIA_MODEL = "nvidia/nemotron-mini-4b-instruct";
 const NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
 
 const PROFILES = [
@@ -333,7 +333,7 @@ function page() {
 </style>
 </head><body>
 <h1>Meetango · menor modelo viável</h1>
-<p class="muted">Modelo inicial: <b>Llama 3.2 3B Instruct</b> <span class="muted">(${NVIDIA_MODEL})</span> · 6 posts no máximo · zero novas chamadas de scraping.</p>
+<p class="muted">Modelo inicial: <b>Nemotron Mini 4B Instruct</b> <span class="muted">(${NVIDIA_MODEL})</span> · 6 posts no máximo · zero novas chamadas de scraping.</p>
 <div class="card">
   <div class="row"><b>NVIDIA_API_KEY no servidor:</b> <span class="${NVIDIA_API_KEY ? "ok" : "bad"}">${NVIDIA_API_KEY ? "configurada" : "NÃO configurada"}</span></div>
   <div class="row" style="margin-top:12px"><input id="key" type="password" placeholder="BENCHMARK_RUN_KEY" autocomplete="off" /><button id="run">Executar 10 perfis</button><button id="download" disabled>Baixar JSON</button></div>
@@ -367,7 +367,7 @@ runBtn.onclick=async()=>{
 };
 dlBtn.onclick=()=>{
   const out={generated_at:new Date().toISOString(),test:'meetango_small_model_interest_profile_v1',model:'${NVIDIA_MODEL}',source:'saved_scrapecreators_onecall_v9',normalization:'up_to_6_most_recent_nonempty_captions',results};
-  const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='meetango-ai-llama32-3b-interest.json';a.click();URL.revokeObjectURL(a.href);
+  const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='meetango-ai-nemotron-mini-4b-interest.json';a.click();URL.revokeObjectURL(a.href);
 };
 </script></body></html>`;
 }
