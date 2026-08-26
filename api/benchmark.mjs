@@ -37,16 +37,17 @@ function normalize(provider, username, raw, latencyMs, extra = {}) {
 
   const avatar = pick(p, [
     "profile_pic_url_hd", "profilePicUrlHD", "profile_pic_url", "profilePicUrl",
+    "profile_image_link",
     "hd_profile_pic_url_info.url", "hd_profile_pic_versions.0.url"
   ]);
   const bio = pick(p, ["biography", "bio", "biography_with_entities.raw_text"]) || "";
-  const fullName = pick(p, ["full_name", "fullName", "name"]);
+  const fullName = pick(p, ["full_name", "fullName", "profile_name", "name"]);
   const followers = pick(p, ["edge_followed_by.count", "followers", "followersCount", "follower_count"]);
   const following = pick(p, ["edge_follow.count", "following", "followsCount", "following_count"]);
   const postsCount = pick(p, ["edge_owner_to_timeline_media.count", "posts_count", "postsCount", "media_count"]);
   const isPrivate = pick(p, ["is_private", "private"]);
   const isVerified = pick(p, ["is_verified", "verified"]);
-  const returnedUsername = pick(p, ["username", "user_name"]);
+  const returnedUsername = pick(p, ["username", "user_name", "account"]);
 
   return {
     provider,
@@ -127,7 +128,9 @@ async function runBrightData(username) {
   const r = await fetchJson(url, {
     method: "POST",
     headers: { "Authorization": `Bearer ${key}`, "Content-Type": "application/json" },
-    body: JSON.stringify([{ url: `https://www.instagram.com/${username}/` }]),
+    body: JSON.stringify({
+      input: [{ url: `https://www.instagram.com/${username}/` }]
+    }),
   }, 65000);
   if (!r.ok) throw new Error(`HTTP ${r.status}: ${JSON.stringify(r.body).slice(0,500)}`);
   return normalize("brightdata", username, r.body, r.latencyMs, { records_charged_estimate: Array.isArray(r.body) ? r.body.length : 1 });
