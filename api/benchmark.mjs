@@ -444,6 +444,66 @@ export function buildBrightDataProfileDiscovery(username) {
   return { url, body: { input: [{ user_name: username }] } };
 }
 
+export function buildBrightDataAsyncBatch(usernames) {
+  const url = new URL("https://api.brightdata.com/datasets/v3/trigger");
+  url.searchParams.set("dataset_id", "gd_l1vikfch901nx3by4");
+  url.searchParams.set("type", "discover_new");
+  url.searchParams.set("discover_by", "user_name");
+  url.searchParams.set("notify", "false");
+  url.searchParams.set("include_errors", "true");
+  url.searchParams.set("format", "json");
+  return {
+    url,
+    body: usernames.map((username) => ({ user_name: username })),
+  };
+}
+
+export function classifyBrightDataProgress(body) {
+  const status = String(body?.status || "unknown").toLowerCase();
+  if (status === "ready") return "ready";
+  if (status === "failed") return "failed";
+  return status || "unknown";
+}
+
+export function summarizeBrightDataAsyncBatch(usernames, rawRecords, batchElapsedMs, triggerLatencyMs) {
+  const records = Array.isArray(rawRecords) ? rawRecords : [];
+  const byUsername = new Map();
+  for (const record of records) {
+    const username = pick(record, ["account", "username", "user_name"]);
+    if (username) byUsername.set(String(username).toLowerCase(), record);
+  }
+
+  const results = usernames.map((username) => {
+    const record = byUsername.get(String(username).toLowerCase()) || null;
+    if (!record) {
+      return { username, success: false, posts_returned: 0, captions_nonempty: 0, caption_chars_total: 0 };
+    }
+    const content = extractContentMetrics([record], "brightdata_async_batch");
+    return {
+      username,
+      success: true,
+      profile_posts_count: pick(record, ["posts_count", "postsCount", "media_count"]),
+      avatar_present: Boolean(pick(record, ["profile_image_link", "profile_pic_url_hd", "profile_pic_url"])),
+      ...content,
+    };
+  });
+
+  const successes = results.filter((row) => row.success).length;
+  return {
+    attempts: usernames.length,
+    successes,
+    failures: usernames.length - successes,
+    records_returned: records.length,
+    batch_elapsed_ms: batchElapsedMs,
+    trigger_latency_ms: triggerLatencyMs,
+    effective_ms_per_profile: usernames.length ? Math.round(batchElapsedMs / usernames.length) : null,
+    avg_posts_returned: usernames.length ? Number((results.reduce((a,r)=>a+(r.posts_returned||0),0)/usernames.length).toFixed(2)) : 0,
+    avg_captions_nonempty: usernames.length ? Number((results.reduce((a,r)=>a+(r.captions_nonempty||0),0)/usernames.length).toFixed(2)) : 0,
+    avg_caption_chars_total: usernames.length ? Math.round(results.reduce((a,r)=>a+(r.caption_chars_total||0),0)/usernames.length) : 0,
+    results,
+  };
+}
+
 async function runBrightDataContent(username) {
   const started = Date.now();
   const key = process.env.BRIGHTDATA_API_KEY;
@@ -668,6 +728,26 @@ $('download').onclick=()=>{const payload={generated_at:new Date().toISOString(),
 </script></body></html>`, {headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}});
 }
 
+function brightDataAsyncPage() {
+  return new Response(`<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Meetango — Bright Data Async Batch</title>
+<style>body{font-family:system-ui,sans-serif;max-width:900px;margin:32px auto;padding:0 18px;color:#171717}input,button{font:inherit}input{padding:10px;width:min(520px,100%);box-sizing:border-box}button{padding:10px 14px;margin:5px 4px 5px 0;cursor:pointer}.card{border:1px solid #ddd;border-radius:10px;padding:16px;margin:16px 0}.muted{color:#666}pre{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px;max-height:420px;overflow:auto}table{border-collapse:collapse;width:100%;font-size:14px}th,td{border-bottom:1px solid #ddd;text-align:left;padding:8px}.big{font-size:28px;font-weight:700}</style></head>
+<body><h1>Bright Data — teste assíncrono em lote</h1>
+<div class="card"><b>BENCHMARK_RUN_KEY</b><br><input id="key" type="password" autocomplete="off" placeholder="Cole a chave"></div>
+<div class="card"><h3>Objetivo</h3><p>Enviar os mesmos 10 perfis em <b>uma única coleta assíncrona</b>, receber o snapshot imediatamente e medir quanto tempo o lote leva para ficar pronto.</p></div>
+<div class="card"><button id="run">Executar lote de 10</button><div id="state" class="muted">Aguardando.</div><div id="clock" class="big">0,0 s</div></div>
+<div class="card"><h3>Resultado</h3><div id="summary">Ainda não executado.</div><button id="download" disabled>Baixar JSON</button><pre id="raw">Aguardando...</pre></div>
+<script>
+const selected=${JSON.stringify(RETEST_SELECTED)}; const $=id=>document.getElementById(id); let finalPayload=null; let timer=null;
+function key(){return $('key').value.trim()}
+async function post(payload){const r=await fetch('/api/benchmark',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...payload,key:key()})});const t=await r.text();let b;try{b=JSON.parse(t)}catch{b={raw:t}};if(!r.ok)throw new Error(JSON.stringify(b));return b}
+function fmt(ms){return (ms/1000).toFixed(1).replace('.',',')+' s'}
+$('run').onclick=async()=>{if(!key())return alert('Informe a BENCHMARK_RUN_KEY.');$('run').disabled=true;$('download').disabled=true;finalPayload=null;$('state').textContent='Disparando lote assíncrono...';$('raw').textContent='';try{const start=await post({action:'brightdata_async_start'});const startedAt=start.started_at_ms;const snapshotId=start.snapshot_id;let polls=0;timer=setInterval(()=>{$('clock').textContent=fmt(Date.now()-startedAt)},250);$('state').textContent='Snapshot '+snapshotId+' criado em '+start.trigger_latency_ms+' ms. Aguardando ficar ready...';while(true){await new Promise(r=>setTimeout(r,5000));polls++;const status=await post({action:'brightdata_async_status',snapshot_id:snapshotId,batch_started_at_ms:startedAt,trigger_latency_ms:start.trigger_latency_ms});$('state').textContent='Status: '+status.status+' — consulta '+polls+' — '+fmt(Date.now()-startedAt);$('raw').textContent=JSON.stringify(status,null,2);if(status.status==='failed')throw new Error('Snapshot falhou: '+JSON.stringify(status.progress));if(status.status==='ready'){clearInterval(timer);const result=status.summary;finalPayload={generated_at:new Date().toISOString(),test:'brightdata_async_batch_10',snapshot_id:snapshotId,polls,poll_interval_ms:5000,...result};$('clock').textContent=fmt(result.batch_elapsed_ms);$('summary').innerHTML='<table><tr><th>Métrica</th><th>Resultado</th></tr><tr><td>Perfis</td><td>'+result.successes+'/'+result.attempts+'</td></tr><tr><td>Tempo do trigger</td><td>'+result.trigger_latency_ms+' ms</td></tr><tr><td>Tempo total do lote</td><td>'+fmt(result.batch_elapsed_ms)+'</td></tr><tr><td>Tempo efetivo / perfil</td><td>'+result.effective_ms_per_profile+' ms</td></tr><tr><td>Posts médios</td><td>'+result.avg_posts_returned+'</td></tr><tr><td>Legendas médias</td><td>'+result.avg_captions_nonempty+'</td></tr><tr><td>Chars médios</td><td>'+result.avg_caption_chars_total+'</td></tr></table>';$('download').disabled=false;break;}}}catch(e){if(timer)clearInterval(timer);$('state').textContent='Erro';$('raw').textContent=String(e?.message||e)}finally{$('run').disabled=false}};
+$('download').onclick=()=>{if(!finalPayload)return;const blob=new Blob([JSON.stringify(finalPayload,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='meetango-brightdata-async-batch.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
+</script></body></html>`, {headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}});
+}
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -701,13 +781,50 @@ export default {
         }
       }
 
-      return json({ error: "unknown_action", allowed: ["scout","content_one"] }, 400);
+      if (action === "brightdata_async_start") {
+        const usernames = RETEST_SELECTED.map((row) => row.username);
+        const key = process.env.BRIGHTDATA_API_KEY;
+        const req = buildBrightDataAsyncBatch(usernames);
+        const startedAt = Date.now();
+        const r = await fetchJson(req.url, {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${key}`, "Content-Type": "application/json" },
+          body: JSON.stringify(req.body),
+        }, 15000);
+        if (!r.ok || !r.body?.snapshot_id) {
+          return json({ error: "brightdata_trigger_failed", http_status: r.status, body: r.body }, 502);
+        }
+        return json({ ok: true, snapshot_id: r.body.snapshot_id, trigger_latency_ms: r.latencyMs, started_at_ms: startedAt, profiles: usernames.length });
+      }
+
+      if (action === "brightdata_async_status") {
+        const snapshotId = String(body?.snapshot_id || "");
+        if (!snapshotId) return json({ error: "missing_snapshot_id" }, 400);
+        const key = process.env.BRIGHTDATA_API_KEY;
+        const headers = { "Authorization": `Bearer ${key}` };
+        const progress = await fetchJson(`https://api.brightdata.com/datasets/v3/progress/${encodeURIComponent(snapshotId)}`, { headers }, 15000);
+        if (!progress.ok) return json({ error: "brightdata_progress_failed", http_status: progress.status, body: progress.body }, 502);
+        const status = classifyBrightDataProgress(progress.body);
+        if (status === "failed") return json({ ok: false, status, progress: progress.body });
+        if (status !== "ready") return json({ ok: true, status, progress: progress.body });
+
+        const result = await fetchJson(`https://api.brightdata.com/datasets/v3/snapshot/${encodeURIComponent(snapshotId)}?format=json`, { headers }, 20000);
+        if (!result.ok) return json({ error: "brightdata_snapshot_failed", http_status: result.status, body: result.body }, 502);
+        const startedAt = Number(body?.batch_started_at_ms || Date.now());
+        const triggerLatency = Number(body?.trigger_latency_ms || 0);
+        const usernames = RETEST_SELECTED.map((row) => row.username);
+        const summary = summarizeBrightDataAsyncBatch(usernames, result.body, Date.now() - startedAt, triggerLatency);
+        return json({ ok: true, status: "ready", summary });
+      }
+
+      return json({ error: "unknown_action", allowed: ["scout","content_one","brightdata_async_start","brightdata_async_status"] }, 400);
     }
 
     const provider = url.searchParams.get("provider") || "env";
 
     if (provider === "stage2") return stage2Page();
     if (provider === "retest") return retestPage();
+    if (provider === "brightdata-async") return brightDataAsyncPage();
 
     if (provider === "health") {
       return json({
