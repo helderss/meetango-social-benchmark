@@ -372,25 +372,27 @@ dlBtn.onclick=()=>{
 </script></body></html>`;
 }
 
-export default async function handler(req) {
-  const url = new URL(req.url);
-  if (req.method === "GET") {
-    if (url.searchParams.get("provider") === "ai-small") return html(page());
-    return json({
-      ok: true,
-      benchmark: "meetango_small_model_interest_profile_v1",
-      model: NVIDIA_MODEL,
-      profiles: PROFILES.length,
-      nvidia_api_key_configured: Boolean(NVIDIA_API_KEY),
-      page: "?provider=ai-small",
-    });
-  }
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (request.method === "GET") {
+      if (url.searchParams.get("provider") === "ai-small") return html(page());
+      return json({
+        ok: true,
+        benchmark: "meetango_small_model_interest_profile_v1",
+        model: NVIDIA_MODEL,
+        profiles: PROFILES.length,
+        nvidia_api_key_configured: Boolean(NVIDIA_API_KEY),
+        page: "?provider=ai-small",
+      });
+    }
 
-  if (req.method !== "POST") return json({ ok: false, error: "method_not_allowed" }, 405);
-  let body;
-  try { body = await req.json(); }
-  catch { return json({ ok: false, error: "invalid_json" }, 400); }
-  if (!RUN_KEY || body?.run_key !== RUN_KEY) return json({ ok: false, error: "unauthorized" }, 401);
-  if (body?.action !== "interest_profile") return json({ ok: false, error: "unknown_action" }, 400);
-  return json(await runOne(body?.username));
-}
+    if (request.method !== "POST") return json({ ok: false, error: "method_not_allowed" }, 405);
+    let body;
+    try { body = await request.json(); }
+    catch { return json({ ok: false, error: "invalid_json" }, 400); }
+    if (!RUN_KEY || body?.run_key !== RUN_KEY) return json({ ok: false, error: "unauthorized" }, 401);
+    if (body?.action !== "interest_profile") return json({ ok: false, error: "unknown_action" }, 400);
+    return json(await runOne(body?.username));
+  },
+};
